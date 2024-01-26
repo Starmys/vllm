@@ -31,13 +31,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import MistralConfig
 
-try:
-    import megablocks.ops as ops
-except ImportError:
-    print(
-        "MegaBlocks not found. Please install it by `pip install megablocks`. "
-        "Note that MegaBlocks depends on mosaicml-turbo, which only supports "
-        "Python 3.10 for now.")
+import triton
+import triton.language as tl
+
 try:
     import stk
 except ImportError:
@@ -148,21 +144,88 @@ class MixtralAttention(nn.Module):
         return output
 
 
-class BlockSparseMoE(nn.Module):
-    """
-    Built on the paper and library Megablocks as described in
-    https://arxiv.org/abs/2211.15841. This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accomodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
-    """
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def mixtral_linear_kernel(
+    a_ptr,  # [M, K] or [T * M, K]
+    b_ptr,  # [E, N, K]
+    c_ptr,  # [T * M, N]
+    cnt_ptr,  # [E] in [0, M)
+    idx_ptr,  # [E, M] in [0, T * M)
+    M, N, K, E, T,
+    stride_am, stride_ak,
+    stride_be, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NAME: tl.constexpr
+):
+    eid = tl.program_id(axis=1)
+    pid = tl.program_id(axis=0)
 
-    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int,
-                 top_k: int):
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    cnt = tl.load(cnt_ptr + eid)
+    if pid_m * BLOCK_SIZE_M >= cnt:
+        return
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    mask = offs_m < cnt
+
+    idx = tl.load(idx_ptr + eid * M + offs_m, mask=mask)
+    if NAME == 'w2':
+        a_ptrs = a_ptr + (idx[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    else:
+        a_ptrs = a_ptr + ((idx // T)[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + eid * stride_be + (offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        a = tl.load(a_ptrs, mask=mask[:, None], other=0.0)
+        b = tl.load(b_ptrs)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    if NAME == "w1":
+        accumulator = silu(accumulator)
+    c = accumulator.to(tl.float16)
+
+    c_ptrs = c_ptr + (idx[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    if NAME == "w3":
+        c *= tl.load(c_ptrs, mask=mask[:, None])
+    tl.store(c_ptrs, c, mask=mask[:, None])
+
+
+@triton.jit
+def silu(x):
+    return x * (tl.exp(x) / (1 + tl.exp(x)))
+
+
+class BlockSparseMoE(torch.nn.Module):
+
+    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int, top_k: int):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.ffn_dim = ffn_dim
@@ -170,227 +233,115 @@ class BlockSparseMoE(nn.Module):
         self.top_k = top_k
 
         # gating
-        self.gate = nn.Linear(self.hidden_dim,
-                              self.num_experts,
-                              bias=False,
-                              device=torch.cuda.current_device())
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False, device=torch.cuda.current_device())
 
         tp_size = get_tensor_model_parallel_world_size()
         assert self.ffn_dim % tp_size == 0
         self.ffn_dim_per_partition = self.ffn_dim // tp_size
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
         self.w1 = nn.Parameter(
-            torch.empty(self.ffn_dim_per_partition * self.num_experts,
-                        self.hidden_dim,
-                        device=torch.cuda.current_device()))
-        set_weight_attrs(self.w1, {"weight_loader": self.moe_weight_loader})
+            torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim_per_partition, device=torch.cuda.current_device())
+        )
+        set_weight_attrs(self.w1, {"weight_loader": self.moe_weight_loader_transpose})
         self.w2 = nn.Parameter(
-            torch.empty(self.ffn_dim_per_partition * self.num_experts,
-                        self.hidden_dim,
-                        device=torch.cuda.current_device()))
+            torch.empty(self.num_experts, self.ffn_dim_per_partition, self.hidden_dim, device=torch.cuda.current_device())
+        )
         set_weight_attrs(self.w2, {"weight_loader": self.moe_weight_loader})
         self.w3 = nn.Parameter(
-            torch.empty(self.ffn_dim_per_partition * self.num_experts,
-                        self.hidden_dim,
-                        device=torch.cuda.current_device()))
-        set_weight_attrs(self.w3, {"weight_loader": self.moe_weight_loader})
+            torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim_per_partition, device=torch.cuda.current_device())
+        )
+        set_weight_attrs(self.w3, {"weight_loader": self.moe_weight_loader_transpose})
 
-        # Calculate the number of bits needed to represent the expert indices
-        # so that we can pass it to radix sort.
-        self.sort_end_bit = max(int(np.ceil(np.log2(self.num_experts))), 1)
-        self.blocking = 128
-        self.quantize_scatter_num_bits = -1
-
-        # Calculate the number of bits needed to represent the column indices
-        # in the intermediate sparse matrix.
-        max_column_index = (self.ffn_dim * self.num_experts) // self.blocking
-        self.transpose_sort_end_bit = max(
-            int(np.ceil(np.log2(max_column_index))), 1)
-
-    def moe_weight_loader(self, param: nn.Parameter,
-                          loaded_weight: torch.Tensor) -> None:
+    def moe_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         """
         Load the weights for the MoE linear layer.
         """
         tp_rank = get_tensor_model_parallel_rank()
         shard_size = self.ffn_dim_per_partition
         loaded_weight = loaded_weight.view(self.num_experts, self.ffn_dim, -1)
-        loaded_weight = loaded_weight[:, shard_size * tp_rank:shard_size *
-                                      (tp_rank + 1)]
+        loaded_weight = loaded_weight[:, shard_size * tp_rank:shard_size * (tp_rank + 1)]
         loaded_weight = loaded_weight.reshape_as(param)
         param.data.copy_(loaded_weight)
 
-    def sparse_transpose(
-            self, size: int, row_indices,
-            column_indices) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        block_columns = size[1] // self.blocking
-
-        # Sort row indices by column indices to get the transposed matrix's
-        # column indices.
-        #
-        # NOTE: Our sort operation uses the same width indices as the input
-        # values. To avoid overflow when we have large activation matrices
-        # we cast to 32-bit before sorting.
-        _, gather_indices = ops.sort(column_indices.int(),
-                                     self.transpose_sort_end_bit)
-
-        # There are a constant number of blocks in every row of the sparse
-        # matrix. A blocks offset is:
-        #
-        # row_index * blocks_per_row + column_index % blocks_per_row
-        #
-        # Once we have the block offsets ordered for transposition we can
-        # divide by blocks_per_row to get the transposed column indices.
-        column_indices_t = row_indices.gather(0, gather_indices.long())
-        block_offsets_t = gather_indices.int()
-
-        zero = torch.zeros((1, ), dtype=torch.int32, device=row_indices.device)
-        nnz_per_column = ops.histogram(column_indices, block_columns)
-        nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
-        offsets_t = torch.cat([zero, nnz_per_column])
-        return column_indices_t, offsets_t, block_offsets_t
-
-    def topology(self, x: torch.Tensor,
-                 padded_bins: torch.Tensor) -> "stk.Matrix":
-        padded_tokens, _ = x.size()
-        assert padded_tokens % self.blocking == 0
-        assert self.ffn_dim_per_partition % self.blocking == 0
-
-        # Offsets for the sparse matrix. All rows have the
-        # same number of nonzero blocks dictated by the
-        # dimensionality of a single expert.
-        block_rows = padded_tokens // self.blocking
-        blocks_per_row = self.ffn_dim_per_partition // self.blocking
-        offsets = torch.arange(
-            0,
-            block_rows * blocks_per_row + 1,
-            blocks_per_row,
-            dtype=torch.int32,
-            device=x.device,
-        )
-
-        # Indices for the sparse matrix. The indices for
-        # the intermediate matrix are dynamic depending
-        # on the mapping of tokens to experts.
-        column_indices = ops.topology(padded_bins, self.blocking, block_rows,
-                                      blocks_per_row)
-
-        # TODO(tgale): This is unused. Remove the need for this in stk.
-        # For now, use meta init to save the device memory.
-        data = torch.empty(
-            column_indices.numel(),
-            self.blocking,
-            self.blocking,
-            dtype=x.dtype,
-            device="meta",
-        )
-        shape = (padded_tokens, self.ffn_dim_per_partition * self.num_experts)
-        row_indices = stk.ops.row_indices(shape, data, offsets, column_indices)
-        column_indices_t, offsets_t, block_offsets_t = self.sparse_transpose(
-            shape, row_indices, column_indices)
-        return stk.Matrix(
-            shape,
-            data,
-            row_indices,
-            column_indices,
-            offsets,
-            column_indices_t,
-            offsets_t,
-            block_offsets_t,
-        )
-
-    def indices_and_padded_bins(
-        self, selected_experts: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor]:
-        # Sort the expert ids to produce the scatter/gather
-        # indices for the permutation.
-        selected_experts = selected_experts.int()
-        bin_ids, indices = ops.sort(selected_experts, self.sort_end_bit)
-
-        # Histogram the expert ids to identify the number of
-        # tokens routed to each expert.
-        tokens_per_expert = ops.histogram(selected_experts, self.num_experts)
-
-        # Round the token counts up to the block size used in
-        # the matrix muliplications. Caculate the starting
-        # position of each bin.
-        padded_tokens_per_expert = ops.round_up(tokens_per_expert,
-                                                self.blocking)
-        padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
-        padded_bins = promote_scalar(padded_bins)
-
-        # Calculate the bin bounds for the sorted tokens.
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
-        bins = promote_scalar(bins)
-        return indices, bin_ids, bins, padded_bins, tokens_per_expert
+    def moe_weight_loader_transpose(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        """
+        Load the weights for the MoE linear layer.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = self.ffn_dim_per_partition
+        loaded_weight = loaded_weight.view(self.num_experts, self.ffn_dim, -1).transpose_(-1, -2)
+        loaded_weight = loaded_weight[:, :, shard_size * tp_rank:shard_size * (tp_rank + 1)]
+        loaded_weight = loaded_weight.reshape_as(param)
+        param.data.copy_(loaded_weight)
 
     @torch.inference_mode()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (sequence_length, model_dim)
-        gate_logits: (sequence_length, n_experts)
-        """
-        # optional reshape
-        input_shape = x.shape
-        x = x.view(-1, input_shape[-1])
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
 
-        # gate_logits: (sequence_length, n_experts)
-        gate_logits = self.gate(x)
-        # all_probs: (sequence_length, n_experts) and upcast for softmax
-        all_probs = F.softmax(gate_logits, dim=1, dtype=torch.float)
-        # weights, selected_experts: (sequence_length, top-k)
-        weights, selected_experts = torch.topk(all_probs, self.top_k, dim=-1)
-        weights /= weights.sum(dim=-1, keepdim=True)
-        weights = weights.flatten().to(x.dtype)
-        selected_experts = selected_experts.flatten()
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
 
-        (indices, bin_ids, bins, padded_bins,
-         _) = self.indices_and_padded_bins(selected_experts)
+        # sparse index of tokens for each expert
+        # TODO: custom kernel
+        num_tokens = batch_size * sequence_length
+        expert_mask = torch.nn.functional.one_hot(selected_experts.flatten(), num_classes=self.num_experts)
+        expert_cnt = expert_mask.sum(dim=0)
+        expert_idx = expert_mask.argsort(dim=0, descending=True)[:num_tokens].T.contiguous()
 
-        # Permute tokens and pad to prepare expert computation
-        # (top_k * sequence_length + padding, model_dim)
-        x = ops.padded_gather(x, indices, bin_ids, bins, padded_bins,
-                              self.top_k)
-
-        # Create the sparse matrix topology
-        with torch.no_grad():
-            topo = self.topology(x, padded_bins)
-
-        # Perform the expert computation
-        # First Dense x Dense -> Sparse for w1 and w3,
-        # (top_k * sequence_length + padding, ffn_dim * n_experts)
-        x = stk.Matrix(
-            topo.size(),
-            F.silu(stk.ops.sdd(x, self.w1.t(), topo).data) *
-            stk.ops.sdd(x, self.w3.t(), topo).data,
-            topo.row_indices,
-            topo.column_indices,
-            topo.offsets,
-            topo.column_indices_t,
-            topo.offsets_t,
-            topo.block_offsets_t,
+        torch.cuda.set_device(hidden_states.device)
+        intermediate_output = torch.empty(
+            size=(num_tokens * self.top_k, self.ffn_dim_per_partition),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        moe_output = torch.empty(
+            size=(num_tokens * self.top_k, hidden_dim),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        mixtral_linear_kernel[lambda META: (
+            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(self.ffn_dim_per_partition, META['BLOCK_SIZE_N']),
+            self.num_experts
+        )](
+            hidden_states, self.w1, intermediate_output, expert_cnt, expert_idx,
+            num_tokens, self.ffn_dim_per_partition, hidden_dim, self.num_experts, self.top_k,
+            hidden_states.stride(0), hidden_states.stride(1),
+            self.w1.stride(0), self.w1.stride(1), self.w1.stride(2),
+            intermediate_output.stride(0), intermediate_output.stride(1),
+            NAME='w1'
+        )
+        mixtral_linear_kernel[lambda META: (
+            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(self.ffn_dim_per_partition, META['BLOCK_SIZE_N']),
+            self.num_experts
+        )](
+            hidden_states, self.w3, intermediate_output, expert_cnt, expert_idx,
+            num_tokens, self.ffn_dim_per_partition, hidden_dim, self.num_experts, self.top_k,
+            hidden_states.stride(0), hidden_states.stride(1),
+            self.w3.stride(0), self.w3.stride(1), self.w3.stride(2),
+            intermediate_output.stride(0), intermediate_output.stride(1),
+            NAME='w3'
+        )
+        mixtral_linear_kernel[lambda META: (
+            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(hidden_dim, META['BLOCK_SIZE_N']),
+            self.num_experts
+        )](
+            intermediate_output, self.w2, moe_output, expert_cnt, expert_idx,
+            num_tokens, hidden_dim, self.ffn_dim_per_partition, self.num_experts, self.top_k,
+            intermediate_output.stride(0), intermediate_output.stride(1),
+            self.w2.stride(0), self.w2.stride(1), self.w2.stride(2),
+            moe_output.stride(0), moe_output.stride(1),
+            NAME='w2'
         )
 
-        # Then Sparse x Dense -> Dense for w2
-        # (top_k * sequence_length + padding, model_dim)
-        x = stk.ops.dsd(x, self.w2)
-
-        x = tensor_model_parallel_all_reduce(x)
-
-        # Permute back and remove padding
-        # (top_k * sequence_length, model_dim)
-        x = ops.padded_scatter(
-            x,
-            indices,
-            bin_ids,
-            weights,
-            bins,
-            padded_bins,
-            self.top_k,
-            self.quantize_scatter_num_bits,
-        )
-        return x.view(*input_shape)
+        final_hidden_states = (moe_output.reshape(num_tokens, self.top_k, hidden_dim) * routing_weights[:, :, None]).sum(dim=1)
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
 class MixtralDecoderLayer(nn.Module):

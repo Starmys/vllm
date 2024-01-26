@@ -10,7 +10,6 @@ from vllm import LLM, SamplingParams
 
 prompts = ['The best AI company is']
 # prompts = ['The best AI company is'] * 8
-# prompts = ["I've been reading books of old, "]
 print('Prompts:', len(prompts))
 
 # sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=16)
@@ -19,7 +18,7 @@ sampling_params = SamplingParams(temperature=0.0, max_tokens=1000)
 llm = LLM(
     model="mistralai/Mixtral-8x7B-v0.1",
     tensor_parallel_size=4,
-    enforce_eager=True,
+    # enforce_eager=True,
     # max_num_batched_tokens=4096,
     # max_num_seqs=8,
 )
