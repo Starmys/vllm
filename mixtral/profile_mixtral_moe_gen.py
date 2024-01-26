@@ -8,6 +8,7 @@ from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 MODEL_PATH = 'mistralai/Mixtral-8x7B-v0.1'
 WEIGHT_PATH = './layer_0.pt'
 DEVICE = 'cuda:0'
+torch.cuda.set_device(DEVICE)
 
 config = AutoConfig.from_pretrained(MODEL_PATH)
 moe = MixtralSparseMoeBlock(config)
@@ -21,49 +22,38 @@ hidden_states = torch.randn((batch_size, sequence_length, hidden_dim), device=DE
 ref, _ = moe.forward(hidden_states)
 
 with torch.no_grad():
-    for _ in range(10):
+    for _ in range(1000):
         ref, _ = moe.forward(hidden_states)
     torch.cuda.synchronize()
     start = time.perf_counter_ns()
-    for _ in range(10):
+    for _ in range(1000):
         ref, _ = moe.forward(hidden_states)
     torch.cuda.synchronize()
     end = time.perf_counter_ns()
 
-latency = (end - start) / 1e6 / 10
-print(f'MixtralSparseMoeBlock: {latency:.3f} ms')  # 64.510
-
-with torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./trace/gen-raw'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-) as prof:
-    for _ in range(1 + 1 + 3 + 1):
-        prof.step()
-        ref, _ = moe.forward(hidden_states)
+latency = (end - start) / 1e6 / 1000
+print(f'MixtralSparseMoeBlock: {latency:.3f} ms')  # 2.130
 
 
 import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-    ],
-    key=['M', 'N', 'K'],
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+#         triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+#         triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+#         triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+#         triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+#         triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+#         triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+#         triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+#     ],
+#     key=['N', 'K'],
+# )
 @triton.jit
-def mixtral_linear_kernel(
+def mixtral_matvec_kernel(
     a_ptr,  # [M, K] or [T * M, K]
     b_ptr,  # [E, N, K]
     c_ptr,  # [T * M, N]
@@ -71,56 +61,44 @@ def mixtral_linear_kernel(
     idx_ptr,  # [E, M] in [0, T * M)
     M, N, K, E, T,
     stride_am, stride_ak,
-    stride_be, stride_bk, stride_bn,
+    stride_be, stride_bn, stride_bk,
     stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     NAME: tl.constexpr
 ):
-    eid = tl.program_id(axis=1)
-    pid = tl.program_id(axis=0)
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    eid = tl.program_id(axis=2)
+    pid_n = tl.program_id(axis=1)
+    pid_m = tl.program_id(axis=0)
 
     cnt = tl.load(cnt_ptr + eid)
-    if pid_m * BLOCK_SIZE_M >= cnt:
+    if pid_m >= cnt:
         return
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    mask = offs_m < cnt
-
-    idx = tl.load(idx_ptr + eid * M + offs_m, mask=mask)
+    idx = tl.load(idx_ptr + eid * M + pid_m)
     if NAME == 'w2':
-        a_ptrs = a_ptr + (idx[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        a_ptrs = a_ptr + (idx * stride_am + offs_k * stride_ak)
     else:
-        a_ptrs = a_ptr + ((idx // T)[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + eid * stride_be + (offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+        a_ptrs = a_ptr + ((idx // T) * stride_am + offs_k * stride_ak)
+    b_ptrs = b_ptr + eid * stride_be + (offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N, ), dtype=tl.float32)
     for k in range(0, K, BLOCK_SIZE_K):
-        a = tl.load(a_ptrs, mask=mask[:, None], other=0.0)
-        b = tl.load(b_ptrs)
-        accumulator += tl.dot(a, b)
+        a = tl.load(a_ptrs)  # [BLOCK_SIZE_K]
+        b = tl.load(b_ptrs)  # [BLOCK_SIZE_N, BLOCK_SIZE_K]
+        accumulator += tl.sum(a[None, :] * b, 1)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
     if NAME == "w1":
         accumulator = silu(accumulator)
     c = accumulator.to(tl.float16)
 
-    c_ptrs = c_ptr + (idx[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_ptrs = c_ptr + (idx * stride_cm + offs_n * stride_cn)
     if NAME == "w3":
-        c *= tl.load(c_ptrs, mask=mask[:, None])
-    tl.store(c_ptrs, c, mask=mask[:, None])
+        c *= tl.load(c_ptrs)
+    tl.store(c_ptrs, c)
 
 
 @triton.jit
@@ -145,9 +123,9 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
         self.top_k = raw_moe_block.top_k
 
         self.gate = raw_moe_block.gate
-        self.w1 = torch.nn.Parameter(torch.stack([mlp.w1.weight.T for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
-        self.w2 = torch.nn.Parameter(torch.stack([mlp.w2.weight.T for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
-        self.w3 = torch.nn.Parameter(torch.stack([mlp.w3.weight.T for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
+        self.w1 = torch.nn.Parameter(torch.stack([mlp.w1.weight for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
+        self.w2 = torch.nn.Parameter(torch.stack([mlp.w2.weight for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
+        self.w3 = torch.nn.Parameter(torch.stack([mlp.w3.weight for mlp in raw_moe_block.experts]).contiguous(), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -168,7 +146,6 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
         expert_cnt = expert_mask.sum(dim=0)
         expert_idx = expert_mask.argsort(dim=0, descending=True)[:num_tokens].T.contiguous()
 
-        torch.cuda.set_device(hidden_states.device)
         intermediate_output = torch.empty(
             size=(num_tokens * self.top_k, self.ffn_dim),
             device=hidden_states.device,
@@ -179,9 +156,11 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        # META = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'num_stages': 4, 'num_warps': 4}
-        mixtral_linear_kernel[lambda META: (
-            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(self.ffn_dim, META['BLOCK_SIZE_N']),
+        META = {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 256, 'num_stages': 1, 'num_warps': 4}
+        # import ipdb; ipdb.set_trace()
+        mixtral_matvec_kernel[(#lambda META: (
+            num_tokens,
+            triton.cdiv(self.ffn_dim, META['BLOCK_SIZE_N']),
             self.num_experts
         )](
             hidden_states, self.w1, intermediate_output, expert_cnt, expert_idx,
@@ -189,10 +168,11 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
             hidden_states.stride(0), hidden_states.stride(1),
             self.w1.stride(0), self.w1.stride(1), self.w1.stride(2),
             intermediate_output.stride(0), intermediate_output.stride(1),
-            NAME='w1'#, **META
+            NAME='w1', **META
         )
-        mixtral_linear_kernel[lambda META: (
-            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(self.ffn_dim, META['BLOCK_SIZE_N']),
+        mixtral_matvec_kernel[(#lambda META: (
+            num_tokens,
+            triton.cdiv(self.ffn_dim, META['BLOCK_SIZE_N']),
             self.num_experts
         )](
             hidden_states, self.w3, intermediate_output, expert_cnt, expert_idx,
@@ -200,10 +180,11 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
             hidden_states.stride(0), hidden_states.stride(1),
             self.w3.stride(0), self.w3.stride(1), self.w3.stride(2),
             intermediate_output.stride(0), intermediate_output.stride(1),
-            NAME='w3'#, **META
+            NAME='w3', **META
         )
-        mixtral_linear_kernel[lambda META: (
-            triton.cdiv(num_tokens, META['BLOCK_SIZE_M']) * triton.cdiv(hidden_dim, META['BLOCK_SIZE_N']),
+        mixtral_matvec_kernel[(#lambda META: (
+            num_tokens,
+            triton.cdiv(hidden_dim, META['BLOCK_SIZE_N']),
             self.num_experts
         )](
             intermediate_output, self.w2, output, expert_cnt, expert_idx,
@@ -211,7 +192,7 @@ class MixtralSparTAMoeBlock(torch.nn.Module):
             intermediate_output.stride(0), intermediate_output.stride(1),
             self.w2.stride(0), self.w2.stride(1), self.w2.stride(2),
             output.stride(0), output.stride(1),
-            NAME='w2'#, **META
+            NAME='w2', **META
         )
 
         final_hidden_states = (output.reshape(num_tokens, self.top_k, hidden_dim) * routing_weights[:, :, None]).sum(dim=1)
@@ -227,25 +208,14 @@ out, _ = sparta_moe.forward(hidden_states)
 torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 with torch.no_grad():
-    for _ in range(10):
+    for _ in range(1000):
         out, _ = sparta_moe.forward(hidden_states)
     torch.cuda.synchronize()
     start = time.perf_counter_ns()
-    for _ in range(10):
+    for _ in range(1000):
         out, _ = sparta_moe.forward(hidden_states)
     torch.cuda.synchronize()
     end = time.perf_counter_ns()
 
-latency = (end - start) / 1e6 / 10
-print(f'MixtralSparTAMoeBlock: {latency:.3f} ms')  # 60.900
-
-# with torch.profiler.profile(
-#         schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-#         on_trace_ready=torch.profiler.tensorboard_trace_handler('./trace/gen-tri'),
-#         record_shapes=True,
-#         profile_memory=True,
-#         with_stack=True
-# ) as prof:
-#     for _ in range(1 + 1 + 3 + 1):
-#         prof.step()
-#         ref, _ = sparta_moe.forward(hidden_states)
+latency = (end - start) / 1e6 / 1000
+print(f'MixtralSparTAMoeBlock: {latency:.3f} ms')  # 1.188
