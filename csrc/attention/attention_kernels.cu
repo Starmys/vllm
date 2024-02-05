@@ -96,6 +96,8 @@ __device__ void paged_attention_kernel(
   const int num_kv_heads,                 // [num_heads]
   const float scale,
   const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_lens,     // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_nums,     // [num_seqs]
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_blocks_per_seq,
   const float* __restrict__ alibi_slopes, // [num_heads]
@@ -106,13 +108,13 @@ __device__ void paged_attention_kernel(
   const int partition_idx = blockIdx.z;
   const int max_num_partitions = gridDim.z;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const int context_len = context_lens[seq_idx];
-  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= context_len) {
+  const int num_context_blocks = block_nums[seq_idx];
+  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= num_context_blocks * BLOCK_SIZE) {
     // No work to do. Terminate the thread block.
     return;
   }
 
-  const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
+  const int context_len = context_lens[seq_idx];
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
   // [start_block_idx, end_block_idx) is the range of blocks to process.
@@ -122,8 +124,7 @@ __device__ void paged_attention_kernel(
 
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   const int start_token_idx = start_block_idx * BLOCK_SIZE;
-  const int end_token_idx = MIN(start_token_idx + num_blocks * BLOCK_SIZE, context_len);
-  const int num_tokens = end_token_idx - start_token_idx;
+  const int num_tokens = num_blocks * BLOCK_SIZE;
 
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
   constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS
@@ -190,11 +191,14 @@ __device__ void paged_attention_kernel(
   // Each thread group in a warp fetches a key from the block, and computes
   // dot product with the query.
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
+  const int* block_len = block_lens + seq_idx * max_num_blocks_per_seq;
+
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to int64
     // because int32 can lead to overflow when this variable is multiplied by large numbers
     // (e.g., kv_block_stride).
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
+    int valid_token_num = block_len[block_idx];
 
     // Load a key to registers.
     // Each thread in a thread group has a different part of the key.
@@ -236,8 +240,8 @@ __device__ void paged_attention_kernel(
       if (thread_group_offset == 0) {
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
-        const bool mask = token_idx >= context_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
+        const bool mask = physical_block_offset >= valid_token_num;
+        logits[token_idx - start_token_idx] = mask ? -FLT_MAX : qk;
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);
       }
@@ -321,6 +325,7 @@ __device__ void paged_attention_kernel(
     // because int32 can lead to overflow when this variable is multiplied by large numbers
     // (e.g., kv_block_stride).
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
+    int valid_token_num = block_len[block_idx];
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
@@ -352,7 +357,7 @@ __device__ void paged_attention_kernel(
           scalar_t* v_vec_ptr = reinterpret_cast<scalar_t*>(&v_vec);
 #pragma unroll
           for (int j = 0; j < V_VEC_SIZE; j++) {
-            v_vec_ptr[j] = token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
+            v_vec_ptr[j] = (token_idx + j) % BLOCK_SIZE < valid_token_num ? v_vec_ptr[j] : zero_value;
           }
         }
         accs[i] += dot(logits_vec, v_vec);
@@ -438,6 +443,8 @@ __global__ void paged_attention_v1_kernel(
   const int num_kv_heads,                 // [num_heads]
   const float scale,
   const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_lens,     // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_nums,     // [num_seqs]
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_blocks_per_seq,
   const float* __restrict__ alibi_slopes, // [num_heads]
@@ -446,7 +453,7 @@ __global__ void paged_attention_v1_kernel(
   const int kv_head_stride) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, IS_FP8_E5M2_KV_CACHE>(
     /* exp_sums */ nullptr, /* max_logits */ nullptr,
-    out, q, k_cache, v_cache, num_kv_heads, scale, block_tables, context_lens,
+    out, q, k_cache, v_cache, num_kv_heads, scale, block_tables, block_lens, block_nums, context_lens,
     max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride, kv_head_stride);
 }
 
@@ -469,6 +476,8 @@ __global__ void paged_attention_v2_kernel(
   const int num_kv_heads,                 // [num_heads]
   const float scale,
   const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_lens,     // [num_seqs, max_num_blocks_per_seq]
+  const int* __restrict__ block_nums,     // [num_seqs]
   const int* __restrict__ context_lens,   // [num_seqs]
   const int max_num_blocks_per_seq,
   const float* __restrict__ alibi_slopes, // [num_heads]
@@ -477,7 +486,7 @@ __global__ void paged_attention_v2_kernel(
   const int kv_head_stride) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, IS_FP8_E5M2_KV_CACHE, PARTITION_SIZE>(
     exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
-    block_tables, context_lens, max_num_blocks_per_seq, alibi_slopes,
+    block_tables, block_lens, block_nums, context_lens, max_num_blocks_per_seq, alibi_slopes,
     q_stride, kv_block_stride, kv_head_stride);
 }
 
@@ -595,6 +604,8 @@ __global__ void paged_attention_v2_reduce_kernel(
     num_kv_heads,                                                                             \
     scale,                                                                                    \
     block_tables_ptr,                                                                         \
+    block_lens_ptr,                                                                           \
+    block_nums_ptr,                                                                           \
     context_lens_ptr,                                                                         \
     max_num_blocks_per_seq,                                                                   \
     alibi_slopes_ptr,                                                                         \
@@ -617,6 +628,8 @@ void paged_attention_v1_launcher(
   int num_kv_heads,
   float scale,
   torch::Tensor& block_tables,
+  torch::Tensor& block_lens,
+  torch::Tensor& block_nums,
   torch::Tensor& context_lens,
   int max_context_len,
   const c10::optional<torch::Tensor>& alibi_slopes) {
@@ -641,6 +654,8 @@ void paged_attention_v1_launcher(
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
   CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
   int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* block_lens_ptr = block_lens.data_ptr<int>();
+  int* block_nums_ptr = block_nums.data_ptr<int>();
   int* context_lens_ptr = context_lens.data_ptr<int>();
 
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
@@ -692,6 +707,8 @@ void paged_attention_v1_launcher(
     num_kv_heads,                                                            \
     scale,                                                                   \
     block_tables,                                                            \
+    block_lens,                                                              \
+    block_nums,                                                              \
     context_lens,                                                            \
     max_context_len,                                                         \
     alibi_slopes);
@@ -722,6 +739,8 @@ void paged_attention_v1(
   int num_kv_heads,               // [num_heads]
   float scale,
   torch::Tensor& block_tables,    // [num_seqs, max_num_blocks_per_seq]
+  torch::Tensor& block_lens,      // [num_seqs, max_num_blocks_per_seq]
+  torch::Tensor& block_nums,      // [num_seqs]
   torch::Tensor& context_lens,    // [num_seqs]
   int block_size,
   int max_context_len,
@@ -765,6 +784,8 @@ void paged_attention_v1(
     num_kv_heads,                                                                             \
     scale,                                                                                    \
     block_tables_ptr,                                                                         \
+    block_lens_ptr,                                                                           \
+    block_nums_ptr,                                                                           \
     context_lens_ptr,                                                                         \
     max_num_blocks_per_seq,                                                                   \
     alibi_slopes_ptr,                                                                         \
@@ -798,6 +819,8 @@ void paged_attention_v2_launcher(
   int num_kv_heads,
   float scale,
   torch::Tensor& block_tables,
+  torch::Tensor& block_lens,
+  torch::Tensor& block_nums,
   torch::Tensor& context_lens,
   int max_context_len,
   const c10::optional<torch::Tensor>& alibi_slopes) {
@@ -825,6 +848,8 @@ void paged_attention_v2_launcher(
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
   CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
   int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* block_lens_ptr = block_lens.data_ptr<int>();
+  int* block_nums_ptr = block_nums.data_ptr<int>();
   int* context_lens_ptr = context_lens.data_ptr<int>();
 
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
@@ -882,6 +907,8 @@ void paged_attention_v2_launcher(
     num_kv_heads,                                                                \
     scale,                                                                       \
     block_tables,                                                                \
+    block_lens,                                                                  \
+    block_nums,                                                                  \
     context_lens,                                                                \
     max_context_len,                                                             \
     alibi_slopes);
@@ -915,6 +942,8 @@ void paged_attention_v2(
   int num_kv_heads,               // [num_heads]
   float scale,
   torch::Tensor& block_tables,    // [num_seqs, max_num_blocks_per_seq]
+  torch::Tensor& block_lens,      // [num_seqs, max_num_blocks_per_seq]
+  torch::Tensor& block_nums,      // [num_seqs]
   torch::Tensor& context_lens,    // [num_seqs]
   int block_size,
   int max_context_len,

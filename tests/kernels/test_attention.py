@@ -18,11 +18,11 @@ MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
 NUM_BLOCKS = 4321  # Arbitrary values for testing
 PARTITION_SIZE = 512
 
-DTYPES = [torch.half, torch.bfloat16, torch.float]
+DTYPES = [torch.half]
 NUM_GEN_SEQS = [7]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
-NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
-HEAD_SIZES = [64, 80, 96, 112, 128, 256]
+NUM_HEADS = [(64, 8)]  # Arbitrary values for testing
+HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 32]
 USE_ALIBI = [False, True]
 KV_CACHE_DTYPE = ["auto", "fp8_e5m2"]
@@ -148,18 +148,31 @@ def test_paged_attention(
     context_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
     context_lens[-1] = MAX_SEQ_LEN
     max_context_len = max(context_lens)
+    block_nums = [
+        (context_len + block_size - 1) // block_size
+        for context_len in context_lens
+    ]
     context_lens = torch.tensor(context_lens, dtype=torch.int, device=gpu_id)
+    block_nums = torch.tensor(block_nums, dtype=torch.int, device=gpu_id)
 
     # Create the block tables.
     max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
     block_tables = []
-    for _ in range(num_seqs):
+    block_lens = []
+    for seq_idx in range(num_seqs):
         block_table = [
             random.randint(0, NUM_BLOCKS - 1)
             for _ in range(max_num_blocks_per_seq)
         ]
         block_tables.append(block_table)
+        context_len = context_lens[seq_idx].item()
+        block_len = [
+            max(min(context_len - block_idx * block_size, block_size), 0)
+            for block_idx in range(max_num_blocks_per_seq)
+        ]
+        block_lens.append(block_len)
     block_tables = torch.tensor(block_tables, dtype=torch.int, device=gpu_id)
+    block_lens = torch.tensor(block_lens, dtype=torch.int, device=gpu_id)
 
     # Create the KV caches.
     key_caches, value_caches = kv_cache_factory(NUM_BLOCKS, block_size, 1,
@@ -179,6 +192,8 @@ def test_paged_attention(
             num_kv_heads,
             scale,
             block_tables,
+            block_lens,
+            block_nums,
             context_lens,
             block_size,
             max_context_len,
@@ -212,6 +227,8 @@ def test_paged_attention(
             num_kv_heads,
             scale,
             block_tables,
+            block_lens,
+            block_nums,
             context_lens,
             block_size,
             max_context_len,

@@ -48,18 +48,31 @@ def main(
 
     context_lens = [context_len for _ in range(num_seqs)]
     max_context_len = max(context_lens)
+    block_nums = [
+        (context_len + block_size - 1) // block_size
+        for context_len in context_lens
+    ]
     context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
+    block_nums = torch.tensor(block_nums, dtype=torch.int, device="cuda")
 
     # Create the block tables.
     max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
     block_tables = []
-    for _ in range(num_seqs):
+    block_lens = []
+    for seq_idx in range(num_seqs):
         block_table = [
             random.randint(0, NUM_BLOCKS - 1)
             for _ in range(max_num_blocks_per_seq)
         ]
         block_tables.append(block_table)
+        context_len = context_lens[seq_idx].item()
+        block_len = [
+            max(min(context_len - block_idx * block_size, block_size), 0)
+            for block_idx in range(max_num_blocks_per_seq)
+        ]
+        block_lens.append(block_len)
     block_tables = torch.tensor(block_tables, dtype=torch.int, device="cuda")
+    block_lens = torch.tensor(block_lens, dtype=torch.int, device="cuda")
 
     # Create the KV cache.
     key_caches, value_caches = create_kv_caches_with_random(
@@ -100,6 +113,8 @@ def main(
                     num_kv_heads,
                     scale,
                     block_tables,
+                    block_lens,
+                    block_nums,
                     context_lens,
                     block_size,
                     max_context_len,
@@ -118,6 +133,8 @@ def main(
                     num_kv_heads,
                     scale,
                     block_tables,
+                    block_lens,
+                    block_nums,
                     context_lens,
                     block_size,
                     max_context_len,
