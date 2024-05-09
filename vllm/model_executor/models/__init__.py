@@ -55,6 +55,7 @@ _MODELS = {
     "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
     "Starcoder2ForCausalLM": ("starcoder2", "Starcoder2ForCausalLM"),
     "XverseForCausalLM": ("xverse", "XverseForCausalLM"),
+    "Phi3MoEForCausalLM": ("phi3moe", "Phi3MoEForCausalLM"),
 }
 
 # Architecture -> type.

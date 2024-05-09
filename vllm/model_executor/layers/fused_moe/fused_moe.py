@@ -2,7 +2,7 @@
 import functools
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Callable
 
 import torch
 import triton
@@ -322,6 +322,7 @@ def fused_moe(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    routing_func: Callable = torch.topk,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -363,12 +364,12 @@ def fused_moe(
     M, _ = hidden_states.shape
     E, N, _ = w1.shape
 
-    if is_hip():
+    if is_hip() or routing_func != torch.topk:
         # The MoE kernels are not yet supported on ROCm.
         routing_weights = torch.softmax(gating_output,
                                         dim=-1,
                                         dtype=torch.float32)
-        topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
+        topk_weights, topk_ids = routing_func(routing_weights, topk)
     else:
         import vllm._moe_C as moe_kernels
 
