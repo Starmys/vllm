@@ -13,7 +13,6 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import fused_moe
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
@@ -65,8 +64,8 @@ class Phi3MoEConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
-        attention_bias = False,
-        lm_head_bias = False,
+        attention_bias=False,
+        lm_head_bias=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -367,7 +366,7 @@ class Phi3MoEBlock(nn.Module):
                                         self.w2_weight,
                                         router_logits,
                                         self.top_k,
-                                        renormalize=True,
+                                        renormalize=False,
                                         inplace=True,
                                         use_fp8=self.use_fp8,
                                         w1_scale=self.w13_scale,
@@ -389,7 +388,7 @@ class Phi3MoEAttention(nn.Module):
                  hidden_size: int,
                  num_heads: int,
                  num_kv_heads: int,
-                 max_position: int = 4096 * 32,
+                 max_position: int = 4096,
                  rope_theta: float = 10000,
                  quant_config: Optional[QuantizationConfig] = None,
                  sliding_window: Optional[int] = None) -> None:
@@ -430,13 +429,13 @@ class Phi3MoEAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=False,
+            bias=True,
             quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=False,
+            bias=True,
             quant_config=quant_config,
         )
         self.rotary_emb = get_rope(
@@ -494,10 +493,8 @@ class Phi3MoEDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config)
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
 
     def forward(
         self,
@@ -505,27 +502,27 @@ class Phi3MoEDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+        hidden_states = residual + hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.block_sparse_moe(hidden_states)
-        return hidden_states, residual
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
 class Phi3MoEModel(nn.Module):
@@ -552,7 +549,7 @@ class Phi3MoEModel(nn.Module):
             Phi3MoEDecoderLayer(config, quant_config=quant_config)
             for _ in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True)
 
     def forward(
         self,
@@ -562,13 +559,10 @@ class Phi3MoEModel(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i], attn_metadata,
-                                            residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = layer(positions, hidden_states, kv_caches[i], attn_metadata)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -618,6 +612,7 @@ class Phi3MoEForCausalLM(nn.Module):
             # We need bigger padding if using lora for kernel
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
+            bias=True,
         )
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
