@@ -36,7 +36,7 @@ logger = logging.get_logger(__name__)
 
 class Phi3MoEConfig(PretrainedConfig):
 
-    model_type = "phi3moe"
+    model_type = "phi3_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -373,7 +373,8 @@ class Phi3MoEBlock(nn.Module):
                                         w2_scale=self.w2_scale,
                                         a1_scale=self.a13_scale,
                                         a2_scale=self.a2_scale,
-                                        routing_func=sparsemixer)
+                                        routing_func=sparsemixer,
+                                        )
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
