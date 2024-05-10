@@ -386,6 +386,7 @@ class Phi3MoEBlock(nn.Module):
 class Phi3MoEAttention(nn.Module):
 
     def __init__(self,
+                 config: Phi3MoEConfig,
                  hidden_size: int,
                  num_heads: int,
                  num_kv_heads: int,
@@ -430,13 +431,13 @@ class Phi3MoEAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=config.attention_bias,
             quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=True,
+            bias=config.attention_bias,
             quant_config=quant_config,
         )
         self.rotary_emb = get_rope(
@@ -481,6 +482,7 @@ class Phi3MoEDecoderLayer(nn.Module):
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = Phi3MoEAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -613,7 +615,7 @@ class Phi3MoEForCausalLM(nn.Module):
             # We need bigger padding if using lora for kernel
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
-            bias=True,
+            bias=config.lm_head_bias,
         )
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)

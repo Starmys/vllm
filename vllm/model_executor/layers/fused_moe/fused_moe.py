@@ -364,7 +364,9 @@ def fused_moe(
     M, _ = hidden_states.shape
     E, N, _ = w1.shape
 
-    if is_hip() or routing_func != torch.topk:
+    if routing_func != torch.topk:
+        topk_weights, topk_ids = routing_func(gating_output, topk)
+    elif is_hip():
         # The MoE kernels are not yet supported on ROCm.
         routing_weights = torch.softmax(gating_output,
                                         dim=-1,
