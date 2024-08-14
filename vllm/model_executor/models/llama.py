@@ -160,6 +160,7 @@ class LlamaAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
+            layer_idx=int(prefix.split('.')[-2]),
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,

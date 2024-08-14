@@ -775,6 +775,7 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     rotary_percent: float = 1.0,
+    layer_idx: Optional[int] = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -845,9 +846,12 @@ def get_rope(
                 is_neox_style, scaling_factor, dtype, **extra_kwargs)
         # The correct one should be "longrope" but keep "su" here
         # for backward compatible
-        elif scaling_type == "su" or scaling_type == "longrope":
+        elif scaling_type == "su" or scaling_type == "longrope" or scaling_type == "longrope2":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]
+            if scaling_type == "longrope2":
+                short_factor = short_factor[layer_idx]
+                long_factor = long_factor[layer_idx]
             original_max_position = rope_scaling[
                 "original_max_position_embeddings"]
             extra_kwargs = {
@@ -859,6 +863,8 @@ def get_rope(
                 head_size, rotary_dim, max_position, original_max_position,
                 base, is_neox_style, dtype, short_factor, long_factor,
                 **extra_kwargs)
+        elif scaling_type == "longrope2":
+            factors: list[list[float]] | torch.Tensor = rope_scaling["factors"]
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
