@@ -766,6 +766,12 @@ class ExtendedRotaryEmbedding(RotaryEmbedding):
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
+def _to_tuple(v: Any) -> Tuple:
+    if isinstance(v, list):
+        return tuple([_to_tuple(e) for e in v])
+    return v
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -782,7 +788,7 @@ def get_rope(
     if rope_scaling is not None:
         # Transforms every value that is a list into a tuple for caching calls
         rope_scaling_tuple = {
-            k: tuple(v) if isinstance(v, list) else v
+            k: _to_tuple(v) if isinstance(v, list) else v
             for k, v in rope_scaling.items()
         }
         rope_scaling_args = tuple(rope_scaling_tuple.items())
@@ -802,7 +808,7 @@ def get_rope(
             "type"] if "type" in rope_scaling else rope_scaling["rope_type"]
         # The correct one should be "longrope" but keep "su" here
         # for backward compatible
-        if scaling_type not in {"su", "longrope", "llama3"}:
+        if scaling_type not in {"su", "longrope", "longrope2", "llama3"}:
             scaling_factor = rope_scaling["factor"]
         if scaling_type == "llama3":
             rotary_emb = ExtendedRotaryEmbedding(head_size, rotary_dim,
@@ -863,8 +869,6 @@ def get_rope(
                 head_size, rotary_dim, max_position, original_max_position,
                 base, is_neox_style, dtype, short_factor, long_factor,
                 **extra_kwargs)
-        elif scaling_type == "longrope2":
-            factors: list[list[float]] | torch.Tensor = rope_scaling["factors"]
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb

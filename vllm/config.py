@@ -1565,7 +1565,7 @@ def _get_and_verify_max_len(
 
         # The correct one should be "longrope", kept "su" here
         # to be backward compatible
-        if rope_type not in ("su", "longrope", "llama3"):
+        if rope_type not in ("su", "longrope", "longrope2", "llama3"):
             if disable_sliding_window:
                 # TODO(robertgshaw): Find a model that supports rope_scaling
                 # with sliding window to see if this case should be allowed.
